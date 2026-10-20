@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minionpatch"
+version = "0.1.0"
+description = "Conservative unused-import detection with human-approved fixes, powered by OpenMinion."
+requires-python = ">=3.10"
+dependencies = ["openminion==0.1.1"]
+[project.scripts]
+minionpatch = "minionpatch.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
