@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import socket
 from typing import Optional
+from urllib.parse import urlparse
 
 from .models import ImportFinding
 
@@ -50,35 +51,51 @@ def check_live_provider_status(config_dir: Optional[Path] = None) -> tuple[bool,
     if provider == "echo" or demo_mode:
         return False, f"OpenMinion is configured in demo mode with provider '{provider}' (Echo does not perform AI reasoning)"
 
-    # Check for Cortensor local endpoint check
-    if provider == "cortensor":
-        cortensor_cfg = data.get("providers", {}).get("cortensor", {})
-        base_url = cortensor_cfg.get("base_url", "http://127.0.0.1:8080")
+    # Check for local Ollama endpoint
+    if provider == "ollama":
+        ollama_cfg = data.get("providers", {}).get("ollama", {})
+        base_url = ollama_cfg.get("base_url", "http://127.0.0.1:11434")
+
         host = "127.0.0.1"
-        port = 8080
+        port = 11434
+
         if "://" in base_url:
-            host_part = base_url.split("://")[1].split("/")[0]
+            host_part = base_url.split("://", 1)[1].split("/", 1)[0]
             if ":" in host_part:
-                host, port_str = host_part.split(":", 1)
+                host, port_str = host_part.rsplit(":", 1)
                 try:
                     port = int(port_str)
                 except ValueError:
-                    port = 8080
-            else:
-                host = host_part
-                port = 80
+                    return False, "Invalid Ollama endpoint port"
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.5)
         try:
-            res = sock.connect_ex((host, port))
-            sock.close()
-            if res != 0:
-                return False, f"Cortensor endpoint {host}:{port} is unreachable"
-        except Exception:
-            return False, f"Cortensor endpoint {host}:{port} connection check failed"
+            with socket.create_connection((host, port), timeout=1):
+                pass
+            return True, f"Ollama endpoint reachable at {host}:{port}"
+        except OSError:
+            return False, f"Ollama endpoint {host}:{port} is unreachable"
 
-        return True, f"Cortensor endpoint reachable at {host}:{port}"
+    # Check for Cortensor endpoint (hosted Portal or direct Router)
+    if provider == "cortensor":
+        cortensor_cfg = data.get("providers", {}).get("cortensor", {})
+        base_url = os.environ.get("CORTENSOR_API_URL") or cortensor_cfg.get("base_url", "http://127.0.0.1:8080/api/v2/completions")
+        api_key_env = cortensor_cfg.get("api_key_env", "CORTENSOR_API_KEY")
+        api_key = cortensor_cfg.get("api_key") or os.environ.get(api_key_env, "")
+
+        is_hosted_portal = "cortensor.app" in base_url or base_url.startswith("https://")
+        if is_hosted_portal and not api_key:
+            return False, f"Cortensor Portal requires environment variable '{api_key_env}', which is unset"
+
+        parsed = urlparse(base_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                pass
+            return True, f"Cortensor endpoint reachable at {host}:{port}"
+        except OSError:
+            return False, f"Cortensor endpoint {host}:{port} is unreachable"
 
     # For cloud providers, check if the required API key environment variable is set
     env_var = SUPPORTED_KEY_ENVS.get(provider)
@@ -90,10 +107,21 @@ def check_live_provider_status(config_dir: Optional[Path] = None) -> tuple[bool,
     return False, f"Provider '{provider}' is not a recognized live provider"
 
 
+def _sanitize_error(exc: Exception) -> str:
+    """Sanitize error messages to ensure API keys and secret values are never exposed."""
+    msg = str(exc)
+    for env_var in SUPPORTED_KEY_ENVS.values():
+        val = os.environ.get(env_var)
+        if val and len(val) >= 4 and val in msg:
+            msg = msg.replace(val, "***")
+    return msg
+
+
 def explain_finding(
     finding: ImportFinding,
     source_context: Optional[str] = None,
     use_ai: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> str:
     """Generate an explanation for an import finding.
     
@@ -109,7 +137,7 @@ def explain_finding(
             f"  Reason: {finding.explanation}"
         )
 
-    is_live, reason = check_live_provider_status()
+    is_live, reason = check_live_provider_status(config_dir=config_dir)
 
     if not is_live:
         return (
@@ -120,17 +148,34 @@ def explain_finding(
             f"Falling back to deterministic rule-based analysis."
         )
 
-    # Attempt query to live OpenMinion agent
+    # Attempt query to live OpenMinion agent / runtime
     try:
-        from openminion import Agent  # type: ignore[import-untyped]
+        from openminion.api.runtime import APIRuntime
+        from openminion.modules.llm.schemas import Message
 
         prompt = (
             f"Explain why the import `{finding.statement}` (binding `{finding.bound_name}`) "
-            f"at line {finding.line} might be unused, and what caution the developer should take."
+            f"at line {finding.line} might be unused, and what caution the developer should take. "
+            f"Keep your explanation concise (2-3 sentences)."
         )
-        with Agent(session_id="minionpatch-explain") as agent:
-            result = agent.run(prompt)
-            ai_text = result.text.strip() if hasattr(result, "text") else str(result).strip()
+        agents_file = (config_dir / "agents.json") if config_dir else Path(".openminion/agents.json")
+        rt = APIRuntime.from_config_path(str(agents_file), logging_mode="quiet")
+        try:
+            resp = rt.llm_runtime.client.complete(
+                messages=[Message(role="user", content=prompt)]
+            )
+            ai_text = resp.output_text.strip()
+        finally:
+            rt.close()
+
+        if not ai_text:
+            return (
+                f"[NON-AI DETERMINISTIC FALLBACK] Line {finding.line}: `{finding.statement}`\n"
+                f"  Bound name: `{finding.bound_name}` (confidence: {finding.confidence})\n"
+                f"  Reason: {finding.explanation}\n"
+                f"  Notice: Live AI provider returned an empty response (verify API key and endpoint). "
+                f"Falling back to deterministic rule-based analysis."
+            )
 
         return (
             f"[AI EXPLANATION (OpenMinion)] Line {finding.line}: `{finding.statement}`\n"
@@ -139,9 +184,10 @@ def explain_finding(
             f"proof that an import is safe to remove."
         )
     except Exception as exc:
+        sanitized_msg = _sanitize_error(exc)
         return (
             f"[NON-AI DETERMINISTIC FALLBACK] Line {finding.line}: `{finding.statement}`\n"
             f"  Reason: {finding.explanation}\n"
-            f"  Notice: Failed to query OpenMinion ({exc}). "
+            f"  Notice: Failed to query OpenMinion ({sanitized_msg}). "
             f"Falling back to deterministic rule-based analysis."
         )

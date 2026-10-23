@@ -40,10 +40,30 @@ def test_cli_explain_findings_exit_1(capsys):
     assert "[DETERMINISTIC EXPLANATION]" in out
 
 
-def test_cli_explain_ai_fallback_exit_1(capsys):
+def test_cli_explain_ai_fallback_exit_1(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "minionpatch.explainer.check_live_provider_status",
+        lambda *args, **kwargs: (False, "mocked provider offline"),
+    )
     assert main(["explain", str(EX / "sample_unused_imports.py"), "--ai"]) == 1
     out = capsys.readouterr().out
     assert "[NON-AI DETERMINISTIC FALLBACK]" in out
+    assert "mocked provider offline" in out
+
+
+def test_cli_explain_ai_live_mode(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "minionpatch.explainer.check_live_provider_status",
+        lambda *args, **kwargs: (True, "mocked provider online"),
+    )
+    def fake_explain(finding, source_context=None, use_ai=False, config_dir=None):
+        return f"[AI EXPLANATION (OpenMinion)] Line {finding.line}: `{finding.statement}`\nMocked reasoning."
+
+    monkeypatch.setattr("minionpatch.cli.explain_finding", fake_explain)
+    assert main(["explain", str(EX / "sample_unused_imports.py"), "--ai"]) == 1
+    out = capsys.readouterr().out
+    assert "[AI EXPLANATION (OpenMinion)]" in out
+    assert "Mocked reasoning." in out
 
 
 def test_cli_explain_json(capsys):
